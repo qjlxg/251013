@@ -1,0 +1,69 @@
+name: Extract and Save Fund Holdings and Analysis
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+jobs:
+  extract-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install selenium webdriver-manager pandas requests beautifulsoup4 numpy yfinance lxml openpyxl akshare aiofiles aiohttp
+          pip install playwright
+          python -m playwright install
+
+      - name: Install ChromeDriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-chromedriver
+
+      - name: Run the data extraction and analysis script
+        run: python integrated_fund_screener.py
+
+      - name: Commit and push the new data and analysis files
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          files=(
+            "fund_holdings.json"
+            "fund_analysis.json"
+            "fund_basic_info.xlsx"
+            "fund_basic_info.csv"
+            "all_fund_codes.csv"
+            "risk_metrics.json"
+            "fund_managers_data/fund_managers_*.json"
+            "fund_codes.csv"
+            "fund_rankings.csv"
+            "selected_funds.csv"
+            "valuation_*.json"
+            "manager_index_screened_funds.csv"
+            "recommended_cn_funds.csv"
+            "filtered_funds.csv"
+            "merged_funds.csv"
+          )
+          
+          for file in "${files[@]}"; do
+            if ls $file 2>/dev/null; then
+              git add $file
+              git commit -m "Automated: Save $file" || echo "No changes to $file"
+            else
+              echo "未找到 $file"
+            fi
+          done
+          git push
