@@ -1,15 +1,33 @@
 name: 2-Extract and Save Fund Holdings and Analysis
 
+# -----------------------------------------------------------
+# 修改点 1: 限制触发条件 - 只有指定文件改动时才运行
+# -----------------------------------------------------------
 on:
   push:
     branches:
       - main
+    paths:
+      - '.github/workflows/integrated_fund_screener.yml'
+      - 'integrated_fund_screener.py'
+  
+  # -----------------------------------------------------------
+  # 修改点 2: 设置定时运行 - 每 3 小时运行一次
+  # -----------------------------------------------------------
   schedule:
+    # '0 */3 * * *' 表示每隔 3 小时的第 0 分钟运行一次 (如 00:00, 03:00, 06:00 等)
     - cron: '0 */3 * * *'
+  
   workflow_dispatch:
 
 jobs:
   extract-data:
+    # -----------------------------------------------------------
+    # 修改点 3: 设置时区环境变量为 Asia/Shanghai (上海时间)
+    # -----------------------------------------------------------
+    env:
+      TZ: Asia/Shanghai
+      
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -29,10 +47,13 @@ jobs:
 
       - name: Install ChromeDriver
         run: |
+          # 在 GitHub Actions 的环境中，建议使用 Playwright/Selenium Manager
+          # 如果您的 integrated_fund_screener.py 脚本需要 ChromeDriver，保留此步骤
           sudo apt-get update
           sudo apt-get install -y chromium-chromedriver
 
       - name: Run the data extraction and analysis script
+        # 运行您核心的筛选脚本
         run: python integrated_fund_screener.py
 
       - name: Commit and push the new data and analysis files
@@ -61,9 +82,16 @@ jobs:
           for file in "${files[@]}"; do
             if ls $file 2>/dev/null; then
               git add $file
-              git commit -m "Automated: Save $file" || echo "No changes to $file"
+              # 使用 || true 避免在没有实际提交时因错误退出
+              git commit -m "Automated: Save $file" || true
             else
               echo "未找到 $file"
             fi
           done
-          git push
+          # 仅在有新的文件被添加或修改时才执行 push
+          if git diff --cached --exit-code; then
+            echo "没有新的数据文件需要推送。"
+          else
+            git push
+            echo "已成功推送新的数据文件。"
+          fi
