@@ -10,35 +10,38 @@ from datetime import datetime, timedelta
 import akshare as ak
 import random
 import io
-import asyncio # 新增
-import aiohttp # 新增
-import logging # 新增
-from tqdm.asyncio import tqdm # 新增，用于异步进度条
+import asyncio # 新增：异步库
+import aiohttp # 新增：异步HTTP库
+import logging # 新增：日志库
+from tqdm.asyncio import tqdm # 新增：异步进度条库
+
+# --- 全局配置 ---
+MAX_CONCURRENCY = 20 # 异步并发数
+FAILED_FUNDS_FILE = 'failed_funds.txt'
+MAX_RETRIES = 3
+LOCAL_DATA_DIR = 'fund_data' 
+CACHE_DURATION_DAYS = 7 # 静态信息缓存周期：7天更新一次
 
 # --- 日志配置 ---
 LOG_FILE = 'fund_screener.log'
 # 清理旧日志文件，确保本次运行的日志是新的
-if os.path.exists(LOG_FILE):
-    os.remove(LOG_FILE)
+# if os.path.exists(LOG_FILE):
+#     os.remove(LOG_FILE) # 移除操作可能导致权限问题，改为追加/覆盖
 
 logging.basicConfig(
     level=logging.INFO, 
     filename=LOG_FILE, 
-    filemode='w',
+    filemode='a', # 使用追加模式，或者 'w' 覆盖模式
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-# 配置控制台输出，便于实时查看进度和重要信息
+# 配置控制台输出
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(formatter)
-logging.getLogger().addHandler(console_handler)
-
-# --- 全局配置 ---
-MAX_CONCURRENCY = 20 # 异步并发数，比线程数可以更高
-FAILED_FUNDS_FILE = 'failed_funds.txt'
-MAX_RETRIES = 3
-LOCAL_DATA_DIR = 'fund_data' 
+# 检查是否已添加，避免重复输出
+if not any(isinstance(handler, logging.StreamHandler) for handler in logging.getLogger().handlers):
+    logging.getLogger().addHandler(console_handler)
 
 def randHeader():
     head_user_agent = [
@@ -53,11 +56,28 @@ def randHeader():
         'Referer': 'http://fund.eastmoney.com/'
     }
 
+# 注意：原同步 getURL 函数已由 getURL_async 替代，为了保持代码结构清洁，已移除同步版本。
+# 原代码：
+# def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
+#     for i in range(tries_num):
+#         try:
+#             time.sleep(random.uniform(0.5, sleep_time))
+#             res = requests.get(url, headers=randHeader(), timeout=time_out, proxies=proxies)
+#             res.raise_for_status()
+#             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功获取 {url}")
+#             return res.text
+#         except Exception as e:
+#             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {url} 连接失败，第 {i+1} 次重试: {e}")
+#             time.sleep(sleep_time + i * 1)
+#     return None
+
+
 # --- 异步 HTTP 请求函数 (替代 getURL) ---
 async def getURL_async(url, session, tries_num=5, sleep_time=1, time_out=15, proxies=None, **kwargs):
+    """使用 aiohttp 实现的异步请求，带有重试机制。"""
     for i in range(tries_num):
         try:
-            # 异步等待
+            # 异步等待，防止对API造成过大压力
             await asyncio.sleep(random.uniform(0.1, sleep_time))
             # 使用 aiohttp session 进行请求
             async with session.get(url, headers=randHeader(), timeout=time_out, proxy=proxies, **kwargs) as res:
@@ -76,6 +96,7 @@ async def getURL_async(url, session, tries_num=5, sleep_time=1, time_out=15, pro
 
 # --- 异步获取单周期排名数据 ---
 async def fetch_ranking_period(period, sd, ed, url, session, akshare_period_map, proxies):
+    """异步获取单个周期的基金排名数据。"""
     try:
         response_text = await getURL_async(url, session, proxies=proxies)
         
@@ -83,6 +104,7 @@ async def fetch_ranking_period(period, sd, ed, url, session, akshare_period_map,
             raise ValueError("无法获取响应")
             
         content = response_text
+        # 正则表达式清理和格式化 JSON
         content = re.sub(r'var rankData\s*=\s*({.*?});?', r'\1', content)
         content = content.replace('datas:', '"datas":').replace('allRecords:', '"allRecords":').replace('success:', '"success":').replace('count:', '"count":')
         content = re.sub(r'([,{])(\w+):', r'\1"\2":', content)
@@ -115,6 +137,7 @@ async def fetch_ranking_period(period, sd, ed, url, session, akshare_period_map,
         # 由于 akshare 是同步库，在异步函数中调用需要 run_in_executor
         try:
             loop = asyncio.get_event_loop()
+            # 使用 run_in_executor 运行同步的 akshare 函数
             fallback_df = await loop.run_in_executor(None, ak.fund_open_fund_rank_em)
             
             fallback_df['code'] = fallback_df['基金代码'].astype(str).str.zfill(6)
@@ -143,6 +166,7 @@ async def fetch_ranking_period(period, sd, ed, url, session, akshare_period_map,
 
 # --- 异步获取基金排名 ---
 async def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2025-09-16', proxies=None):
+    """异步获取所有周期的基金排名并合并。"""
     periods = {
         '3y': (start_date, end_date),
         '2y': (f"{int(end_date[:4])-2}{end_date[4:]}", end_date),
@@ -183,7 +207,7 @@ async def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2
     return pd.DataFrame()
 
 def apply_4433_rule(df, total_records):
-    # ... (与之前版本相同)
+    """应用四四三三法则进行基金筛选。"""
     thresholds = {
         '3y': 0.25, '2y': 0.25, '1y': 0.25,
         '6m': 1/3, '3m': 1/3
@@ -200,8 +224,12 @@ def apply_4433_rule(df, total_records):
     logging.info(f"四四三三法则筛选出 {len(filtered_df)} 只基金 (初始: {initial_count})")
     return filtered_df
 
-# --- 异步下载/读取历史数据 ---
+# --- 异步下载/读取历史数据 (包含数据验证) ---
 async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_date: str = None, per_page: int = 40) -> dict:
+    """
+    优先从本地读取基金净值数据，如果过期或缺失则从网络下载更新。
+    包含数据验证逻辑。
+    """
     if end_date is None:
         end_date = datetime.now().strftime('%Y%m%d')
         
@@ -215,7 +243,7 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
         try:
             df_local = pd.read_csv(local_csv_path, encoding='utf-8-sig')
             
-            # 列名映射
+            # 列名映射和清洗
             if 'date' in df_local.columns and 'net_value' in df_local.columns:
                 df_local.rename(columns={'date': '净值日期', 'net_value': '单位净值'}, inplace=True)
             elif '净值日期' not in df_local.columns or '单位净值' not in df_local.columns:
@@ -253,6 +281,7 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
                 if not response_text:
                     raise Exception("API请求失败")
                 
+                # 解析总页数
                 data_str = re.sub(r'^var apidata=', '', response_text)
                 data_str = re.findall(r'\{.*\}', data_str)[0]
                 data = json.loads(data_str)
@@ -264,7 +293,6 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
                 for page in range(1, total_pages + 1):
                     page_params = params.copy()
                     page_params['page'] = page
-                    # 创建异步任务，注意 aiohttp.ClientSession 不能跨任务共享，此处在外部创建后传入
                     page_tasks.append(getURL_async(base_url, session, params=page_params, sleep_time=0.5))
                 
                 page_responses = await asyncio.gather(*page_tasks)
@@ -291,7 +319,7 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
                 df_download['单位净值'] = pd.to_numeric(df_download['单位净值'], errors='coerce')
                 df_download.sort_values(by='净值日期', inplace=True)
                 
-                # --- 保存到 fund_data 目录 ---
+                # --- 保存到 fund_data 目录 (更新缓存) ---
                 os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
                 df_download.to_csv(local_csv_path, index=False, encoding='utf-8-sig')
                 logging.info(f"基金 {fund_code}: 下载完成并保存到本地目录：{local_csv_path}")
@@ -303,9 +331,8 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
             if df_final is None and os.path.exists(local_csv_path):
                  logging.warning("网络下载失败，退回使用旧的本地数据 (可能不完整)。")
                  try:
-                     # 重新加载旧数据（这次不检查时效性）
                      df_local = pd.read_csv(local_csv_path, encoding='utf-8-sig')
-                     # ... (省略列名映射和清洗，与第 1 步相同)
+                     # ... (重新进行列名映射和清洗，此处简化，假定数据结构正确)
                      if 'date' in df_local.columns and 'net_value' in df_local.columns:
                          df_local.rename(columns={'date': '净值日期', 'net_value': '单位净值'}, inplace=True)
                      elif '净值日期' not in df_local.columns or '单位净值' not in df_local.columns:
@@ -325,9 +352,10 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
         logging.error(f"基金 {fund_code}: 无法获取任何历史净值数据。")
         with open(FAILED_FUNDS_FILE, 'a') as f:
             f.write(f"{fund_code}: 无法获取数据\n")
-        return {'csv_filename': None, 'rose_1y': np.nan, 'rose_6m': np.nan}
+        # 抛出异常，让 process_single_fund 知道此基金失败
+        raise ValueError("无法获取净值数据")
     
-    # --- 数据验证 ---
+    # --- 数据验证 (净值缺失比例检查) ---
     if df_final['单位净值'].isna().sum() / len(df_final) > 0.1:
         logging.error(f"基金 {fund_code}: 净值数据缺失比例过高 (>10%)，跳过该基金。")
         raise ValueError("净值数据缺失比例过高")
@@ -351,8 +379,26 @@ async def download_fund_csv(fund_code: str, start_date: str = '20200101', end_da
     
     return {'csv_filename': temp_csv_path, 'rose_1y': rose_1y, 'rose_6m': rose_6m}
 
-# --- 异步获取基金详情 ---
-async def get_fund_details(fund_code, proxies=None):
+# --- 异步获取基金详情 (包含缓存) ---
+async def get_fund_details(fund_code, proxies=None, output_dir='data'):
+    """获取基金详情（规模、经理姓名），并使用本地缓存。"""
+    output_filename = f"fund_details_{fund_code}.json"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # --- 1. 检查缓存 ---
+    if os.path.exists(output_path):
+        modified_time = datetime.fromtimestamp(os.path.getmtime(output_path))
+        if (datetime.now() - modified_time) < timedelta(days=CACHE_DURATION_DAYS):
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    result = json.load(f)
+                    logging.info(f"基金 {fund_code}: 使用详情缓存。")
+                    return result
+            except Exception:
+                logging.warning(f"基金 {fund_code}: 读取详情缓存失败，重新下载。")
+                pass 
+                
+    # --- 2. 缓存过期或不存在，执行下载 ---
     try:
         url = f'http://fund.eastmoney.com/f10/{fund_code}.html'
         async with aiohttp.ClientSession() as session:
@@ -361,13 +407,14 @@ async def get_fund_details(fund_code, proxies=None):
         if not response_text:
             raise ValueError("无法获取响应")
             
-        # pd.read_html 仍是同步操作，使用 run_in_executor 避免阻塞
         loop = asyncio.get_event_loop()
+        # pd.read_html 仍是同步操作，使用 run_in_executor 避免阻塞
         tables = await loop.run_in_executor(None, pd.read_html, io.StringIO(response_text))
         
         if len(tables) < 2:
             raise ValueError("表格数量不足")
             
+        # 提取基本信息表格
         df_info = tables[0].T.set_index(0).to_dict()
         df = df_info[list(df_info.keys())[0]]
         
@@ -389,13 +436,38 @@ async def get_fund_details(fund_code, proxies=None):
             'scale': scale,
             'manager': manager
         }
+        
+        # 3. 保存新缓存 (使用 run_in_executor 写入)
+        os.makedirs(output_dir, exist_ok=True)
+        await loop.run_in_executor(None, lambda: json.dump(result, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False))
+        logging.info(f"基金 {fund_code}: 详情数据已更新并缓存。")
         return result
+        
     except Exception as e:
         logging.warning(f"获取 {fund_code} 详情失败: {e}")
+        # 失败时返回默认值
         return {'fund_code': fund_code, 'fund_name': 'N/A', 'fund_type': 'N/A', 'scale': 0, 'manager': 'N/A'}
 
-# --- 异步获取基金经理数据 ---
+# --- 异步获取基金经理数据 (包含修复和缓存) ---
 async def get_fund_managers(fund_code, output_dir='data'):
+    """获取基金经理历史任职数据，包含表格定位修复和本地缓存。"""
+    output_filename = f"fund_managers_{fund_code}.json"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # --- 1. 检查缓存 ---
+    if os.path.exists(output_path):
+        modified_time = datetime.fromtimestamp(os.path.getmtime(output_path))
+        if (datetime.now() - modified_time) < timedelta(days=CACHE_DURATION_DAYS):
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    result = json.load(f)
+                    logging.info(f"基金 {fund_code}: 使用经理历史缓存。")
+                    return result
+            except Exception:
+                logging.warning(f"基金 {fund_code}: 读取经理缓存失败，重新下载。")
+                pass
+                
+    # --- 2. 缓存过期或不存在，执行下载 ---
     try:
         url = f'http://fundf10.eastmoney.com/jjjl_{fund_code}.html'
         async with aiohttp.ClientSession() as session:
@@ -404,44 +476,57 @@ async def get_fund_managers(fund_code, output_dir='data'):
         if not response_text:
             raise ValueError("无法获取响应")
         
-        # BeautifulSoup 也是同步操作，使用 run_in_executor 避免阻塞
         loop = asyncio.get_event_loop()
+        # BeautifulSoup 是同步操作，使用 run_in_executor 避免阻塞
         soup = await loop.run_in_executor(None, BeautifulSoup, response_text, 'lxml')
         
-        table = soup.find('table', class_='fjjl')
-        if not table:
-            raise ValueError("未找到经理表格")
+        # 核心修复点：查找 class='jloff' 的表格（基金经理变动一览）
+        all_tables = soup.find_all('table', class_='jloff') 
+        if not all_tables:
+            raise ValueError("未找到经理表格 (class jloff)")
+            
+        # “基金经理变动一览”通常是第一个符合该类的表格
+        table = all_tables[0]
             
         rows = table.find_all('tr')[1:]
         result = []
         for row in rows:
             cols = row.find_all('td')
+            # 经理任职变动表有 5 列：起始期, 截止期, 基金经理, 任职期间, 任职回报
             if len(cols) >= 5:
+                manager_tag = cols[2].find('a') # 确保获取到经理姓名
+                manager_name = manager_tag.text.strip() if manager_tag else cols[2].text.strip()
                 return_text = cols[4].text.strip()
-                fund_return = float(return_text.replace('%', '')) if '%' in return_text and return_text != '--' else np.nan
+                
+                # 清洗回报数据，移除百分号等非数字字符
+                fund_return = float(re.sub(r'[^\d\.\-]', '', return_text)) if '%' in return_text and return_text != '--' else np.nan
+
                 result.append({
-                    'name': cols[2].text.strip(),
-                    'tenure_start': cols[3].text.strip(),
+                    'name': manager_name,
+                    'tenure_start': cols[0].text.strip(),
+                    'tenure_end': cols[1].text.strip(),
                     'return': fund_return
                 })
+        
+        # 3. 保存新缓存 (使用 run_in_executor 写入)
         os.makedirs(output_dir, exist_ok=True)
-        output_filename = f"fund_managers_{fund_code}.json"
-        output_path = os.path.join(output_dir, output_filename)
-        # IO操作使用 run_in_executor
         await loop.run_in_executor(None, lambda: json.dump(result, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False))
-        logging.info(f"基金 {fund_code}: 经理数据已保存至 '{output_path}'")
+        logging.info(f"基金 {fund_code}: 经理数据已更新并缓存至 '{output_path}'")
         return result
+        
     except Exception as e:
         logging.warning(f"获取基金 {fund_code} 经理数据失败: {e}")
         return []
 
 # --- 风险参数分析 (同步，使用 run_in_executor) ---
 def analyze_fund_sync(fund_code, start_date, end_date):
+    """同步计算基金的夏普比率和最大回撤。"""
     try:
         csv_path = f'data/{fund_code}_fund_history.csv'
         if not os.path.exists(csv_path):
              return {"error": "历史数据文件不存在"}
              
+        # pandas 读取和计算是 CPU 密集型操作，适合在 Executor 中运行
         df = pd.read_csv(csv_path, encoding='utf-8-sig')
         df['净值日期'] = pd.to_datetime(df['净值日期'])
         df['单位净值'] = pd.to_numeric(df['单位净值'], errors='coerce')
@@ -459,13 +544,16 @@ def analyze_fund_sync(fund_code, start_date, end_date):
         if max_daily_move > 0.20:
             logging.warning(f"基金 {fund_code}: 存在极端日波动 ({max_daily_move:.2%})，可能影响指标可靠性。")
             
+        # 假设无风险利率为 3% (0.03)
+        risk_free_rate = 0.03
+        
         annual_returns = returns.mean() * 252
         annual_volatility = returns.std() * np.sqrt(252)
         
         if annual_volatility < 0.001:
             logging.warning(f"基金 {fund_code}: 年化波动率接近零，指标可能不可靠。")
 
-        sharpe_ratio = (annual_returns - 0.03) / annual_volatility if annual_volatility != 0 else np.nan
+        sharpe_ratio = (annual_returns - risk_free_rate) / annual_volatility if annual_volatility != 0 else np.nan
         
         cum_returns = (1 + returns).cumprod()
         rolling_max = cum_returns.expanding().max()
@@ -480,6 +568,7 @@ def analyze_fund_sync(fund_code, start_date, end_date):
             'max_drawdown': float(max_drawdown)
         }
         output_path = f'data/risk_metrics_{fund_code}.json'
+        # 保存风险指标
         json.dump(result, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
         logging.info(f"基金 {fund_code}: 风险指标已保存至 '{output_path}'")
         return result
@@ -488,6 +577,7 @@ def analyze_fund_sync(fund_code, start_date, end_date):
         return {"error": "风险参数计算失败"}
 
 async def analyze_fund(fund_code, start_date, end_date):
+    """异步包装器，用于在线程池中执行同步的分析函数。"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None, 
@@ -499,6 +589,7 @@ async def analyze_fund(fund_code, start_date, end_date):
 
 # --- 异步处理单个基金 ---
 async def process_single_fund(fund_code, start_date, end_date, attempt=1):
+    """异步处理单个基金的所有数据抓取和分析任务。"""
     logging.info(f"[Attempt {attempt}] 开始处理基金 {fund_code}...")
     
     fund_data = {
@@ -510,31 +601,34 @@ async def process_single_fund(fund_code, start_date, end_date, attempt=1):
     
     try:
         # 1. 下载历史净值并计算短期回报 (await)
+        # 如果下载/验证失败，会抛出异常
         result = await download_fund_csv(fund_code, start_date='20200101', end_date=end_date)
         if result['csv_filename']:
             fund_data['rose_1y'] = result['rose_1y']
             fund_data['rose_6m'] = result['rose_6m']
             
-        # 2. 获取基金详情 (await)
+        # 2. 获取基金详情 (await - 包含缓存)
         details = await get_fund_details(fund_code)
         fund_data['scale'] = details.get('scale', 0)
         fund_data['manager'] = details.get('manager', 'N/A')
         
-        # 3. 获取并分析风险指标 (await)
+        # 3. 获取并分析风险指标 (await - 在线程池中执行)
         risk_metrics = await analyze_fund(fund_code, start_date, end_date)
         if 'error' not in risk_metrics:
             fund_data['sharpe_ratio'] = risk_metrics.get('sharpe_ratio', np.nan)
             fund_data['max_drawdown'] = risk_metrics.get('max_drawdown', np.nan)
             
-        # 4. 获取经理数据 (await)
+        # 4. 获取经理数据 (await - 包含缓存和修复)
         await get_fund_managers(fund_code)
         
         logging.info(f"基金 {fund_code} 处理完成。")
         return fund_data
         
     except Exception as e:
-        logging.error(f"基金 {fund_code} 整体处理失败: {e}")
-        # 失败基金代码已在 download_fund_csv 中记录，此处不再重复
+        logging.error(f"基金 {fund_code} 整体处理失败: {e.__class__.__name__}: {e}")
+        # 记录失败代码，用于重试
+        with open(FAILED_FUNDS_FILE, 'a') as f:
+            f.write(f"{fund_code}: {e.__class__.__name__}\n")
         return None
 
 # --- 主异步爬取函数 ---
@@ -561,6 +655,7 @@ async def main_scraper():
         return
     
     merged_data = recommended_df.copy()
+    # 确保所有列存在，以便后续合并
     for col in ['rose_1y', 'rose_6m', 'scale', 'manager', 'sharpe_ratio', 'max_drawdown']:
         if col not in merged_data.columns:
             merged_data[col] = np.nan if col not in ['manager'] else 'N/A'
@@ -590,7 +685,8 @@ async def main_scraper():
             break
             
         with open(FAILED_FUNDS_FILE, 'r') as f:
-            failed_codes = [line.split(':')[0].strip() for line in f.readlines()]
+            # 仅提取代码部分
+            failed_codes = [line.split(':')[0].strip() for line in f.readlines() if line.strip()]
             failed_codes = list(set(failed_codes)) # 去重
             
         logging.info(f"\n--- 第 {attempt} 轮重试：处理 {len(failed_codes)} 只失败基金 ---")
@@ -611,13 +707,13 @@ async def main_scraper():
     if all_results:
         results_df = pd.DataFrame(all_results).set_index('code')
         
-        # 使用 update 合并结果
+        # 使用 update 合并结果（仅更新有数据的字段）
         merged_data.update(results_df) 
 
     merged_path = 'merged_funds.csv'
     merged_data.to_csv(merged_path, encoding='gbk')
     logging.info(f"\n--- 最终结果 ---")
-    logging.info(f"合并数据（含1年/6月回报、规模等）保存至 '{merged_path}'")
+    logging.info(f"合并数据（含1年/6月回报、规模、风险指标等）保存至 '{merged_path}'")
     if os.path.exists(FAILED_FUNDS_FILE) and os.path.getsize(FAILED_FUNDS_FILE) > 0:
          logging.warning(f"注意: 仍有基金处理失败，请检查 '{FAILED_FUNDS_FILE}' 文件。")
     elif os.path.exists(FAILED_FUNDS_FILE):
