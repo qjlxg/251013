@@ -9,6 +9,7 @@ on:
       - main
     paths:
       - '.github/workflows/integrated_fund_screener.yml'
+      # 确保您的脚本名称是 integrated_fund_screener.py
       - 'integrated_fund_screener.py'
   
   # -----------------------------------------------------------
@@ -41,14 +42,17 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install selenium webdriver-manager pandas requests beautifulsoup4 numpy yfinance lxml openpyxl akshare aiofiles aiohttp
-          pip install playwright
-          python -m playwright install
+          # --- 核心修改：新增 aiohttp, tqdm, lxml (用于BeautifulSoup), akshare, openpyxl ---
+          pip install pandas requests beautifulsoup4 numpy akshare openpyxl
+          pip install aiohttp tqdm
+          # 原有的非必要/未使用的库已移除，如果您的脚本中确实使用了 yfinance/selenium/webdriver-manager/playwright，请添加回来
+          # 针对同步IO操作，仍需安装 lxml (BeautifulSoup依赖)
+          pip install lxml
 
       - name: Install ChromeDriver
+        # 由于新脚本中主要依赖异步请求而非Selenium/Playwright，此步骤可能不再必要，但为保持原有功能完整性，暂时保留。
+        # 如果您的脚本后续不需要WebDriver，可以删除此步骤。
         run: |
-          # 在 GitHub Actions 的环境中，建议使用 Playwright/Selenium Manager
-          # 如果您的 integrated_fund_screener.py 脚本需要 ChromeDriver，保留此步骤
           sudo apt-get update
           sudo apt-get install -y chromium-chromedriver
 
@@ -60,6 +64,10 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          # 脚本运行过程中会在 'data/' 目录下生成大量临时文件，最好不要全部提交。
+          # 推荐在 .gitignore 中忽略 'data/' 目录。
+          # 此外，日志文件 fund_screener.log 也应该被提交。
           
           files=(
             "fund_holdings.json"
@@ -77,13 +85,15 @@ jobs:
             "recommended_cn_funds.csv"
             "filtered_funds.csv"
             "merged_funds.csv"
+            "fund_screener.log"  # 新增：提交日志文件
+            "failed_funds.txt"   # 新增：提交失败基金列表
           )
           
           for file in "${files[@]}"; do
             if ls $file 2>/dev/null; then
               git add $file
               # 使用 || true 避免在没有实际提交时因错误退出
-              git commit -m "Automated: Save $file" || true
+              git commit -m "Automated: Update $file" || true
             else
               echo "未找到 $file"
             fi
