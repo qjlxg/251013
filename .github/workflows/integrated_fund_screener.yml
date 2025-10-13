@@ -1,4 +1,4 @@
-name: Extract and Save Fund Holdings and Analysis
+name: 2-Extract and Save Fund Holdings and Analysis
 
 on:
   push:

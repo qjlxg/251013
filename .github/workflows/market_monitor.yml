@@ -1,4 +1,4 @@
-name: Run Market Monitor
+name: 4-Run Market Monitor
 
 on:
   schedule:

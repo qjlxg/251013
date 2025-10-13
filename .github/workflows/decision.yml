@@ -1,4 +1,4 @@
-name: Fund Sell Decision Workflow-4
+name: 5-Fund Sell Decision Workflow
 
 on:
   push:

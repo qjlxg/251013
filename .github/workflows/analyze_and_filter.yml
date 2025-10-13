@@ -1,4 +1,4 @@
-name: Financial Data Analyzer
+name: 3-Financial Data Analyzer
 
 on:
   workflow_dispatch:  # 允许在GitHub上手动点击运行此工作流
