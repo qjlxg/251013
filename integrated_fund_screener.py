@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import random
+from io import StringIO  # 新增导入以修复 FutureWarning
 
 def randHeader():
     head_user_agent = [
@@ -22,11 +23,11 @@ def randHeader():
         'Referer': 'http://fund.eastmoney.com/'
     }
 
-def getURL(url, tries_num=5, sleep_time=1, time_out=15):
+def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
     for i in range(tries_num):
         try:
             time.sleep(random.uniform(0.5, sleep_time))
-            res = requests.get(url, headers=randHeader(), timeout=time_out)
+            res = requests.get(url, headers=randHeader(), timeout=time_out, proxies=proxies)
             res.raise_for_status()
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功获取 {url}")
             return res
@@ -36,7 +37,7 @@ def getURL(url, tries_num=5, sleep_time=1, time_out=15):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 请求 {url} 失败，已达最大重试次数")
     return None
 
-def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2025-09-16'):
+def get_fund_rankings(fund_type='hh', start_date='2022-10-14', end_date='2025-10-14'):
     periods = {
         '3y': (start_date, end_date),
         '2y': (f"{int(end_date[:4])-2}{end_date[4:]}", end_date),
@@ -86,15 +87,15 @@ def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2025-09
             f'rank({period})': ranks,
             f'rank_r({period})': rank_rs
         })
+        df['name'] = df['code'] + 'C'  # 临时名称
         df.set_index('code', inplace=True)
         all_data.append(df)
         print(f"获取 {period} 排名数据：{len(df)} 条（总计 {len(fund_codes)}）")
     if all_data:
         df_final = all_data[0].copy()
         for df in all_data[1:]:
-            df_final = df_final.join(df, how='outer')
-        # 临时 name
-        df_final['name'] = df_final.index + 'C'
+            cols_to_join = [col for col in df.columns if col != 'name']
+            df_final = df_final.join(df[cols_to_join], how='outer')
         df_final.to_csv('fund_rankings.csv', encoding='gbk')
         print(f"排名数据已保存至 'fund_rankings.csv'")
         return df_final
@@ -115,7 +116,7 @@ def apply_4433_rule(df, total_records):
 
 def download_fund_csv(fund_code: str, start_date: str = '20200101', end_date: str = None) -> dict:
     if end_date is None:
-        end_date = datetime.now().strftime('%Y%m%d')
+        end_date = '20251014'  # 固定为 2025-10-14
     csv_filename = f'fund_data/{fund_code}.csv'
     if not os.path.exists(csv_filename):
         print(f"基金 {fund_code} 本地文件不存在")
@@ -128,8 +129,8 @@ def download_fund_csv(fund_code: str, start_date: str = '20200101', end_date: st
         df['单位净值'] = pd.to_numeric(df['net_value'], errors='coerce')
         df['累计净值'] = ''  # 无数据，置空
         df['日增长率'] = ''  # 无数据，置空
-        one_year_ago = datetime.now() - timedelta(days=365)
-        six_month_ago = datetime.now() - timedelta(days=182)
+        one_year_ago = datetime.strptime(end_date, '%Y%m%d') - timedelta(days=365)
+        six_month_ago = datetime.strptime(end_date, '%Y%m%d') - timedelta(days=182)
         recent_data = df[df['净值日期'] >= one_year_ago]
         six_month_data = df[df['净值日期'] >= six_month_ago]
         rose_1y = (recent_data['单位净值'].iloc[-1] / recent_data['单位净值'].iloc[0] - 1) * 100 if len(recent_data) > 1 else np.nan
@@ -147,7 +148,7 @@ def get_fund_details(fund_code):
         response = getURL(url)
         if not response:
             raise ValueError("无法获取响应")
-        tables = pd.read_html(response.text)
+        tables = pd.read_html(StringIO(response.text))  # 使用 StringIO 修复 FutureWarning
         if len(tables) < 2:
             raise ValueError("表格数量不足")
         df = tables[0]
@@ -231,14 +232,14 @@ def analyze_fund(fund_code, start_date, end_date):
 
 def main_scraper():
     print("开始从本地 fund_data 读取并计算基金排名并筛选...")
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - pd.DateOffset(years=3)).strftime('%Y-%m-%d')
+    end_date = '2025-10-14'  # 固定为 2025-10-14
+    start_date = '2022-10-14'  # 3年前
     rankings_df = get_fund_rankings(fund_type='hh', start_date=start_date, end_date=end_date)
     
     if not rankings_df.empty:
         total_records = len(rankings_df)
         recommended_df = apply_4433_rule(rankings_df, total_records)
-        # 更新真实 name（从网上获取）
+        # 更新真实 name
         for code in recommended_df.index:
             details = get_fund_details(code)
             recommended_df.loc[code, 'name'] = details.get('fund_name', code + 'C')
@@ -263,21 +264,17 @@ def main_scraper():
     
     for i, fund_code in enumerate(fund_codes, 1):
         print(f"[{i}/{len(fund_codes)}] 处理基金 {fund_code}...")
-        # 读取本地历史净值并计算短期回报
         result = download_fund_csv(fund_code, start_date='20200101', end_date=end_date)
         if result['csv_filename']:
             merged_data.loc[merged_data.index == fund_code, 'rose_1y'] = result['rose_1y']
             merged_data.loc[merged_data.index == fund_code, 'rose_6m'] = result['rose_6m']
-        # 获取基金详情（name 已更新，但这里更新 scale 和 manager）
         details = get_fund_details(fund_code)
         merged_data.loc[merged_data.index == fund_code, 'scale'] = details.get('scale', 0)
         merged_data.loc[merged_data.index == fund_code, 'manager'] = details.get('manager', 'N/A')
-        # 获取并分析风险指标
         risk_metrics = analyze_fund(fund_code, start_date, end_date)
         if 'error' not in risk_metrics:
             merged_data.loc[merged_data.index == fund_code, 'sharpe_ratio'] = risk_metrics.get('sharpe_ratio', np.nan)
             merged_data.loc[merged_data.index == fund_code, 'max_drawdown'] = risk_metrics.get('max_drawdown', np.nan)
-        # 获取经理数据
         get_fund_managers(fund_code)
         time.sleep(5)
     
