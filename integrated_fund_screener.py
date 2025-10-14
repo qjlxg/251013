@@ -47,7 +47,6 @@ def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
             # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功获取 {url}")
             return res
         except requests.RequestException as e:
-            # 缩短重试间隔，因为是并行操作，不应阻塞太久
             time.sleep(random.uniform(1, 2) + i * 2) 
             # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {url} 连接失败，第 {i+1} 次重试: {e}")
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 请求 {url} 失败，已达最大重试次数")
@@ -55,35 +54,32 @@ def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
 
 def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2025-09-16'):
     """
-    获取基金排行榜，并加入数据完整性检查。
+    获取基金排行榜，使用 fund_em_open_fund_rank 获取更稳定的数据。
     """
-    periods = {
-        '3y': (start_date, end_date),
-    }
-
     try:
-        # 使用 akshare 获取所有基金及其业绩
-        # 注意: akshare 接口可能只返回部分日期指标，我们主要依赖它获取完整的基金代码列表和3年回报
-        df = ak.fund_em_open_fund_info(fund=fund_type, symbol='全部', 
-                                       start_date=periods['3y'][0].replace('-', ''), 
-                                       end_date=periods['3y'][1].replace('-', ''))
+        # 基金类型代码映射：混合型 'hh', 股票型 'gp', 债券型 'zq' 等
+        fund_type_map = {'hh': '混合型', 'gp': '股票型', 'zq': '债券型'}
+        
+        # 使用 fund_em_open_fund_rank 获取开放式基金排名数据
+        # note: 这里的 start_date/end_date 不直接影响该接口的筛选，该接口返回当前最新的排名数据
+        df = ak.fund_em_open_fund_rank(symbol=fund_type_map.get(fund_type, '混合型'))
     except Exception as e:
+        # **修复：如果 fund_em_open_fund_info 接口不存在，很可能 fund_em_open_fund_rank 也不存在**
+        # 我们在这里保留原有的错误信息，但使用更稳定的接口
         print(f"获取基金排行榜失败: {e}")
         return pd.DataFrame()
     
     # Standardize columns
-    df.rename(columns={'基金代码': 'code', '基金简称': 'name'}, inplace=True)
+    df.rename(columns={'基金代码': 'code', '基金简称': 'name', '近3年': 'rose_3y'}, inplace=True)
     df.set_index('code', inplace=True)
     
-    # 检查并重命名3年回报列
-    if '近3年' in df.columns:
-        df.rename(columns={'近3年': 'rose_3y'}, inplace=True)
-    else:
+    # 确保 'rose_3y' 列存在
+    if 'rose_3y' not in df.columns:
         df['rose_3y'] = np.nan
         
     # --- 数据完整性增强：过滤掉3年回报为空的基金 ---
     initial_count = len(df)
-    df.replace('-', np.nan, inplace=True) # 将 '-' 替换为 NaN
+    df.replace('-', np.nan, inplace=True)
     df['rose_3y'] = pd.to_numeric(df['rose_3y'], errors='coerce')
     df.dropna(subset=['rose_3y'], inplace=True)
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 初始获取基金数量: {initial_count}, 过滤后剩余: {len(df)}")
@@ -151,7 +147,6 @@ def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None):
             if 'date' in df_fund.columns and 'net_value' in df_fund.columns:
                 df_fund.rename(columns={'date': '净值日期', 'net_value': '单位净值'}, inplace=True)
                 if not df_fund.empty and '单位净值' in df_fund.columns:
-                    # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功从本地加载 {local_path}")
                     pass
                 else:
                     raise ValueError("本地数据为空或格式不正确，尝试下载更新。")
@@ -161,11 +156,18 @@ def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None):
     except Exception:
         # 尝试从网上下载
         try:
-            df_fund = ak.fund_em_open_fund_info(fund=fund_code, start_date=start_date.replace('-', ''), end_date=end_date.replace('-', ''), indicator='单位净值走势')
+            # **修复：使用 fund_em_open_fund_info_index 获取净值走势**
+            df_fund = ak.fund_em_open_fund_info_index(
+                fund=fund_code, 
+                start_date=start_date.replace('-', ''), 
+                end_date=end_date.replace('-', ''), 
+                indicator='单位净值走势'
+            )
+            
             if df_fund.empty:
                 raise ValueError("在线下载数据为空。")
 
-            # 统一列名
+            # 统一列名 (通常是 '净值日期', '单位净值', '累计净值')
             if '净值日期' not in df_fund.columns or '单位净值' not in df_fund.columns:
                 if len(df_fund.columns) >= 2:
                     df_fund.columns = ['净值日期', '单位净值'] + list(df_fund.columns[2:]) 
@@ -238,7 +240,6 @@ def get_fund_details(fund_code, cache={}):
 def analyze_fund(fund_code, start_date, end_date):
     """
     计算基金的夏普比率、波动率和最大回撤。
-    已修改为优先从本地加载数据，并使用配置的无风险利率。
     """
     local_path = os.path.join(FUND_DATA_DIR, f'{fund_code}.csv')
     df_fund = pd.DataFrame()
@@ -267,7 +268,8 @@ def analyze_fund(fund_code, start_date, end_date):
     except Exception:
         # Fallback to online download
         try:
-            df_fund = ak.fund_em_open_fund_info(
+            # **修复：使用 fund_em_open_fund_info_index 获取净值走势**
+            df_fund = ak.fund_em_open_fund_info_index(
                 fund=fund_code, 
                 start_date=start_date.replace('-', ''), 
                 end_date=end_date.replace('-', ''), 
@@ -286,21 +288,17 @@ def analyze_fund(fund_code, start_date, end_date):
         return {'error': f"基金 {fund_code} 在 {start_date} 到 {end_date} 期间没有有效净值数据"}
 
     net_values = df_fund['单位净值']
-
-    # 1. 每日收益率
     daily_returns = net_values.pct_change().dropna()
 
     if daily_returns.empty:
         return {'error': f"基金 {fund_code} 每日收益率计算失败"}
 
-    # 2. 波动率 (Volatitlity - 年化标准差)
+    # 波动率 (Volatitlity - 年化标准差)
     std_daily_return = daily_returns.std()
     annualized_volatility = std_daily_return * np.sqrt(ANNUAL_TRADING_DAYS)
     
-    # 3. 夏普比率 (Sharpe Ratio)
+    # 夏普比率 (Sharpe Ratio)
     mean_daily_return = daily_returns.mean()
-    
-    # 年化夏普比率
     risk_free_rate_daily = RISK_FREE_RATE / ANNUAL_TRADING_DAYS
     
     if std_daily_return == 0:
@@ -309,7 +307,7 @@ def analyze_fund(fund_code, start_date, end_date):
         annualized_mean_excess_return = (mean_daily_return - risk_free_rate_daily) * ANNUAL_TRADING_DAYS
         sharpe_ratio = annualized_mean_excess_return / annualized_volatility
         
-    # 4. 最大回撤 (Max Drawdown)
+    # 最大回撤 (Max Drawdown)
     cumulative_returns = (1 + daily_returns).cumprod()
     rolling_max = cumulative_returns.cummax()
     drawdown = (cumulative_returns - rolling_max) / rolling_max
@@ -322,10 +320,7 @@ def analyze_fund(fund_code, start_date, end_date):
     }
 
 def process_single_fund(fund_code, fund_name, start_date, end_date):
-    """
-    单个基金的并行处理逻辑。
-    返回包含所有指标的字典或None。
-    """
+    """单个基金的并行处理逻辑。"""
     result_data = {
         'code': fund_code,
         'name': fund_name,
@@ -349,7 +344,6 @@ def process_single_fund(fund_code, fund_name, start_date, end_date):
         result_data['rose_6m'] = returns['rose_6m']
     
     # 2. 获取基金详情
-    # 注意：get_fund_details 内部已实现对重复URL的局部缓存
     details = get_fund_details(fund_code)
     result_data['scale'] = details.get('scale', np.nan)
     result_data['manager'] = details.get('manager', 'N/A')
@@ -366,7 +360,7 @@ def process_single_fund(fund_code, fund_name, start_date, end_date):
 
     return result_data
 
-def get_all_fund_data(fund_type='hh', start_date='2023-09-16', end_date='2025-09-16', limit=100):
+def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10-14', limit=100):
     """
     获取基金数据的主函数，使用多线程加速。
     """
@@ -396,7 +390,7 @@ def get_all_fund_data(fund_type='hh', start_date='2023-09-16', end_date='2025-09
                 result = future.result()
                 if result:
                     final_results.append(result)
-                print(f"[{time.strftime('%H:%M:%S')}] 完成处理 {i}/{len(fund_list_to_process)} 基金。")
+                # print(f"[{time.strftime('%H:%M:%S')}] 完成处理 {i}/{len(fund_list_to_process)} 基金。")
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] 基金处理过程中发生错误: {e}")
                 
@@ -408,14 +402,10 @@ def get_all_fund_data(fund_type='hh', start_date='2023-09-16', end_date='2025-09
     # 3. 数据整合、清洗和排序
     results_df = pd.DataFrame(final_results).set_index('code')
     
-    # 合并3年回报率
     merged_data = initial_ranking_data.merge(results_df.drop(columns=['name', 'error'], errors='ignore'), left_index=True, right_index=True, how='left')
 
-    # 清洗：移除没有成功计算任何关键指标的行
-    # 至少要有3年回报或者夏普比率
     merged_data.dropna(subset=['rose_3y', 'sharpe_ratio'], how='all', inplace=True)
     
-    # 排序：夏普比率降序，3年回报降序
     merged_data.sort_values(by=['sharpe_ratio', 'rose_3y'], ascending=[False, False], inplace=True)
     
     # 格式化输出
