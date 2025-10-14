@@ -1,8 +1,5 @@
-name: 2-Extract and Save Fund Holdings and Analysis
+name: Extract and Save Fund Holdings and Analysis
 
-# -----------------------------------------------------------
-# 修改点 1: 限制触发条件 - 只有指定文件改动时才运行
-# -----------------------------------------------------------
 on:
   push:
     branches:
@@ -11,20 +8,13 @@ on:
       - '.github/workflows/integrated_fund_screener.yml'
       - 'integrated_fund_screener.py'
   
-  # -----------------------------------------------------------
-  # 修改点 2: 设置定时运行 - 每 3 小时运行一次
-  # -----------------------------------------------------------
   schedule:
-    # '0 */3 * * *' 表示每隔 3 小时的第 0 分钟运行一次 (如 00:00, 03:00, 06:00 等)
-    - cron: '0 */3 * * *'
+    - cron: '0 */3 * * *'  # 每 3 小时运行一次
   
   workflow_dispatch:
 
 jobs:
   extract-data:
-    # -----------------------------------------------------------
-    # 修改点 3: 设置时区环境变量为 Asia/Shanghai (上海时间)
-    # -----------------------------------------------------------
     env:
       TZ: Asia/Shanghai
       
@@ -41,16 +31,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          # 确保安装了所有需要的库，包括 akshare
-          pip install pandas requests beautifulsoup4 numpy akshare
+          pip install pandas requests beautifulsoup4 numpy lxml
 
-      # 【新增】确保 fund_managers_data 目录存在，因为脚本现在输出 JSON 到此目录
-      - name: Prepare directories
-        run: |
-          mkdir -p fund_managers_data
-
-      - name: Run fund screener script
-        # 运行您核心的筛选脚本
+      - name: Run the data extraction and analysis script
         run: python integrated_fund_screener.py
 
       - name: Commit and push the new data and analysis files
@@ -58,36 +41,27 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # 定义所有需要跟踪的文件，包含新生成的日志和失败文件
           files=(
-            "fund_holdings.json"
-            "fund_analysis.json"
-            "fund_basic_info.xlsx"
-            "fund_basic_info.csv"
-            "all_fund_codes.csv"
-            "data/risk_metrics_*.json"        # 跟踪 data 目录下的风险指标
-            "fund_managers_data/fund_managers_*.json" # 跟踪基金经理 JSON
-            "fund_codes.csv"
             "fund_rankings.csv"
-            "selected_funds.csv"
-            "valuation_*.json"
-            "manager_index_screened_funds.csv"
-            "recommended_cn_funds.csv"        # 最终输出文件
-            "filtered_funds.csv"
-            # "merged_funds.csv"              # 【已注释】不再是关键输出文件
-            "fund_screener.log"               # 日志文件
-            "failed_funds.txt"                # 失败基金列表
+            "recommended_cn_funds.csv"
+            "merged_funds.csv"
+            "data/risk_metrics_*.json"
+            "data/fund_managers_*.json"
+            "failed_funds.txt"
           )
           
           for file in "${files[@]}"; do
             if ls $file 2>/dev/null; then
               git add $file
-              # 使用 || true 避免在没有实际提交时因错误退出
               git commit -m "Automated: Update $file" || true
             else
               echo "未找到 $file"
             fi
           done
           
-          # 确保只有在有改动时才推送到远程仓库
-          git push || true
+          if git diff --cached --exit-code; then
+            echo "没有新的数据文件需要推送。"
+          else
+            git push
+            echo "已成功推送新的数据文件。"
+          fi
