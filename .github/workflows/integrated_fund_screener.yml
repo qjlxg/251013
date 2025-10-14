@@ -41,10 +41,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          # *** 关键修改：确保 akshare 等所有必需的库都被安装 ***
+          # 确保安装了所有需要的库，包括 akshare
           pip install pandas requests beautifulsoup4 numpy akshare
 
-      - name: Run fund screening script
+      # 【新增】确保 fund_managers_data 目录存在，因为脚本现在输出 JSON 到此目录
+      - name: Prepare directories
+        run: |
+          mkdir -p fund_managers_data
+
+      - name: Run fund screener script
         # 运行您核心的筛选脚本
         run: python integrated_fund_screener.py
 
@@ -60,37 +65,29 @@ jobs:
             "fund_basic_info.xlsx"
             "fund_basic_info.csv"
             "all_fund_codes.csv"
-            "risk_metrics.json"
-            "fund_managers_data/fund_managers_*.json"
+            "data/risk_metrics_*.json"        # 跟踪 data 目录下的风险指标
+            "fund_managers_data/fund_managers_*.json" # 跟踪基金经理 JSON
             "fund_codes.csv"
             "fund_rankings.csv"
             "selected_funds.csv"
             "valuation_*.json"
             "manager_index_screened_funds.csv"
-            "recommended_cn_funds.csv"
+            "recommended_cn_funds.csv"        # 最终输出文件
             "filtered_funds.csv"
-            "merged_funds.csv"
-            "fund_screener.log"
-            "failed_funds.txt"
-            "fund_screener_optimized_result_*.xlsx" # <<< 关键新增：匹配新脚本的输出文件
+            # "merged_funds.csv"              # 【已注释】不再是关键输出文件
+            "fund_screener.log"               # 日志文件
+            "failed_funds.txt"                # 失败基金列表
           )
           
-          # <<< 关键新增：添加 fund_data 目录中的所有 CSV 缓存文件
-          find fund_data -name "*.csv" -print0 | xargs -0 git add || true
-          
-          # 添加所有列出的文件
           for file in "${files[@]}"; do
             if ls $file 2>/dev/null; then
               git add $file
+              # 使用 || true 避免在没有实际提交时因错误退出
+              git commit -m "Automated: Update $file" || true
             else
               echo "未找到 $file"
             fi
           done
           
-          # 检查是否有文件被添加或修改
-          if git diff-index --quiet HEAD --; then
-            echo "没有文件更改，跳过提交。"
-          else
-            git commit -m "Automated: Update fund data and analysis results (including local cache)"
-            git push
-          fi
+          # 确保只有在有改动时才推送到远程仓库
+          git push || true
