@@ -13,10 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 全局配置与常量 ---
 FUND_DATA_DIR = 'fund_data'
-# 用户建议：配置无风险利率 (年化百分比，例如 3% -> 0.03)
 RISK_FREE_RATE = 0.03 
 ANNUAL_TRADING_DAYS = 250
-MAX_WORKERS = 10 # 线程池最大工作线程数
+MAX_WORKERS = 10 
 # ----------------------
 
 # 确保本地数据目录存在
@@ -44,53 +43,50 @@ def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
             time.sleep(random.uniform(0.1, sleep_time))
             res = requests.get(url, headers=randHeader(), timeout=time_out, proxies=proxies)
             res.raise_for_status()
-            # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功获取 {url}")
             return res
         except requests.RequestException as e:
             time.sleep(random.uniform(1, 2) + i * 2) 
-            # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {url} 连接失败，第 {i+1} 次重试: {e}")
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 请求 {url} 失败，已达最大重试次数")
     return None
 
-def get_fund_rankings(fund_type='hh', start_date='2022-09-16', end_date='2025-09-16'):
+def get_local_fund_list():
     """
-    获取基金排行榜，使用 fund_em_open_fund_rank 获取更稳定的数据。
+    修改后的函数：不再爬取排行榜。
+    通过扫描本地 fund_data 目录中的 CSV 文件来获取基金代码列表。
     """
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 正在扫描本地目录 {FUND_DATA_DIR} 获取基金代码...")
+    fund_codes = []
+    
     try:
-        # 基金类型代码映射：混合型 'hh', 股票型 'gp', 债券型 'zq' 等
-        fund_type_map = {'hh': '混合型', 'gp': '股票型', 'zq': '债券型'}
-        
-        # 使用 fund_em_open_fund_rank 获取开放式基金排名数据
-        # note: 这里的 start_date/end_date 不直接影响该接口的筛选，该接口返回当前最新的排名数据
-        df = ak.fund_em_open_fund_rank(symbol=fund_type_map.get(fund_type, '混合型'))
-    except Exception as e:
-        # **修复：如果 fund_em_open_fund_info 接口不存在，很可能 fund_em_open_fund_rank 也不存在**
-        # 我们在这里保留原有的错误信息，但使用更稳定的接口
-        print(f"获取基金排行榜失败: {e}")
+        for filename in os.listdir(FUND_DATA_DIR):
+            if filename.endswith('.csv'):
+                # 假设文件名格式为 '基金代码.csv'
+                code = filename.replace('.csv', '')
+                if re.match(r'^\d{6}$', code): # 简单校验代码格式
+                    fund_codes.append(code)
+    except FileNotFoundError:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 错误: 未找到本地基金数据目录 {FUND_DATA_DIR}。")
         return pd.DataFrame()
-    
-    # Standardize columns
-    df.rename(columns={'基金代码': 'code', '基金简称': 'name', '近3年': 'rose_3y'}, inplace=True)
-    df.set_index('code', inplace=True)
-    
-    # 确保 'rose_3y' 列存在
-    if 'rose_3y' not in df.columns:
-        df['rose_3y'] = np.nan
-        
-    # --- 数据完整性增强：过滤掉3年回报为空的基金 ---
-    initial_count = len(df)
-    df.replace('-', np.nan, inplace=True)
-    df['rose_3y'] = pd.to_numeric(df['rose_3y'], errors='coerce')
-    df.dropna(subset=['rose_3y'], inplace=True)
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 初始获取基金数量: {initial_count}, 过滤后剩余: {len(df)}")
-    # ---------------------------------------------
 
-    return df[['name', 'rose_3y']].copy()
+    if not fund_codes:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 本地目录 {FUND_DATA_DIR} 中未找到有效的基金代码 CSV 文件。")
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(index=fund_codes)
+    # 基金名称和3年回报在初始阶段设置为 NaN，将在后续并行处理中尝试填充
+    df['name'] = 'N/A' 
+    df['rose_3y'] = np.nan 
+    
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 成功从本地加载 {len(df)} 个基金代码。")
+
+    return df
+
 
 def calculate_returns(df, end_date_str):
-    """从净值数据计算短期回报率 (1年, 6个月)"""
-    if df.empty or '单位净值' not in df.columns:
-        return {'csv_filename': None, 'rose_1y': np.nan, 'rose_6m': np.nan}
+    """从净值数据计算短期回报率 (3年, 1年, 6个月)"""
+    # 确保列名正确
+    if df.empty or '单位净值' not in df.columns or '净值日期' not in df.columns:
+        return {'rose_3y': np.nan, 'rose_1y': np.nan, 'rose_6m': np.nan}
     
     df['净值日期'] = pd.to_datetime(df['净值日期'])
     df.sort_values(by='净值日期', inplace=True)
@@ -100,63 +96,66 @@ def calculate_returns(df, end_date_str):
     latest_net_value_row = df[df['净值日期'] <= end_date].iloc[-1] if not df[df['净值日期'] <= end_date].empty else None
     
     if latest_net_value_row is None:
-        return {'csv_filename': None, 'rose_1y': np.nan, 'rose_6m': np.nan}
+        return {'rose_3y': np.nan, 'rose_1y': np.nan, 'rose_6m': np.nan}
         
     latest_date = latest_net_value_row['净值日期']
     latest_net_value = latest_net_value_row['单位净值']
     
     returns = {}
 
-    # 1年回报 (rose_1y)
-    date_1y_ago = latest_date - timedelta(days=365)
-    date_1y_value_row = df[df['净值日期'] <= date_1y_ago].iloc[-1] if not df[df['净值日期'] <= date_1y_ago].empty else None
+    # Helper function for return calculation
+    def get_return(days_ago):
+        target_date = latest_date - timedelta(days=days_ago)
+        target_row = df[df['净值日期'] <= target_date].iloc[-1] if not df[df['净值日期'] <= target_date].empty else None
+        
+        if target_row is not None:
+            net_value_target_ago = target_row['单位净值']
+            return (latest_net_value / net_value_target_ago - 1) * 100
+        else:
+            return np.nan
 
-    if date_1y_value_row is not None:
-        net_value_1y_ago = date_1y_value_row['单位净值']
-        returns['rose_1y'] = (latest_net_value / net_value_1y_ago - 1) * 100
-    else:
-        returns['rose_1y'] = np.nan
+    # 3年回报 (rose_3y)
+    returns['rose_3y'] = get_return(365 * 3)
+    
+    # 1年回报 (rose_1y)
+    returns['rose_1y'] = get_return(365)
 
     # 6个月回报 (rose_6m)
-    date_6m_ago = latest_date - timedelta(days=180) 
-    date_6m_value_row = df[df['净值日期'] <= date_6m_ago].iloc[-1] if not df[df['净值日期'] <= date_6m_ago].empty else None
-
-    if date_6m_value_row is not None:
-        net_value_6m_ago = date_6m_value_row['单位净值']
-        returns['rose_6m'] = (latest_net_value / net_value_6m_ago - 1) * 100
-    else:
-        returns['rose_6m'] = np.nan
+    returns['rose_6m'] = get_return(180)
         
-    returns['csv_filename'] = 'Local_or_Downloaded_Data' 
     return returns
 
-def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None):
+def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None, force_download=False):
     """
-    优先从本地 fund_data/{fund_code}.csv 加载数据，失败则回退到网上下载并保存。
+    优先从本地 fund_data/{fund_code}.csv 加载数据，失败或强制下载时回退到网上下载并保存。
+    返回一个包含数据帧和状态的字典。
     """
     if end_date is None:
         end_date = datetime.now().strftime('%Y-%m-%d')
         
     local_path = os.path.join(FUND_DATA_DIR, f'{fund_code}.csv')
     df_fund = pd.DataFrame()
+    loaded_from_local = False
     
     # 1. 尝试从本地加载
-    try:
-        if os.path.exists(local_path):
+    if not force_download and os.path.exists(local_path):
+        try:
             df_fund = pd.read_csv(local_path)
             if 'date' in df_fund.columns and 'net_value' in df_fund.columns:
                 df_fund.rename(columns={'date': '净值日期', 'net_value': '单位净值'}, inplace=True)
                 if not df_fund.empty and '单位净值' in df_fund.columns:
-                    pass
+                    loaded_from_local = True
                 else:
                     raise ValueError("本地数据为空或格式不正确，尝试下载更新。")
             else:
                 raise ValueError("本地CSV文件格式不正确，尝试下载。")
+        except Exception:
+            df_fund = pd.DataFrame() # 清空数据框以便回退到下载
             
-    except Exception:
-        # 尝试从网上下载
+    # 2. 从网上下载 (本地加载失败或强制下载)
+    if not loaded_from_local:
         try:
-            # **修复：使用 fund_em_open_fund_info_index 获取净值走势**
+            # 采用东方财富网开放式基金净值走势接口
             df_fund = ak.fund_em_open_fund_info_index(
                 fund=fund_code, 
                 start_date=start_date.replace('-', ''), 
@@ -167,7 +166,7 @@ def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None):
             if df_fund.empty:
                 raise ValueError("在线下载数据为空。")
 
-            # 统一列名 (通常是 '净值日期', '单位净值', '累计净值')
+            # 统一列名
             if '净值日期' not in df_fund.columns or '单位净值' not in df_fund.columns:
                 if len(df_fund.columns) >= 2:
                     df_fund.columns = ['净值日期', '单位净值'] + list(df_fund.columns[2:]) 
@@ -184,28 +183,27 @@ def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None):
             
         except Exception as e:
             # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 下载基金 {fund_code} 净值失败: {e}")
-            return {'csv_filename': None, 'rose_1y': np.nan, 'rose_6m': np.nan}
-            
-    # 2. 计算短期回报
+            df_fund = pd.DataFrame() # 下载失败
+
+    # 3. 数据过滤和返回
     if not df_fund.empty:
         df_fund['净值日期'] = pd.to_datetime(df_fund['净值日期'])
         df_fund = df_fund[(df_fund['净值日期'] >= pd.to_datetime(start_date)) & 
                           (df_fund['净值日期'] <= pd.to_datetime(end_date))]
-        
-        returns = calculate_returns(df_fund, end_date)
-        return returns
-    else:
-        return {'csv_filename': None, 'rose_1y': np.nan, 'rose_6m': np.nan}
+    
+    # 返回数据帧和状态
+    return {'df': df_fund, 'loaded_from_local': loaded_from_local}
 
 
 def get_fund_details(fund_code, cache={}):
-    """从网页爬取基金规模和基金经理，并使用局部缓存"""
+    """从网页爬取基金规模和基金经理"""
     if fund_code in cache:
         return cache[fund_code]
 
+    # ... (get_fund_details 函数体保持不变，因为只需要规模和经理，这是非核心数据) ...
     url = f"http://fund.eastmoney.com/{fund_code}.html"
     res = getURL(url)
-    details = {'scale': np.nan, 'manager': 'N/A'}
+    details = {'scale': np.nan, 'manager': 'N/A', 'name': fund_code} # 增加 name 字段用于回填
 
     if res:
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -220,84 +218,58 @@ def get_fund_details(fund_code, cache={}):
                     if match:
                         value = float(match.group(1))
                         unit = match.group(2)
-                        # 统一转换为亿元
                         if '万元' in unit:
                             value /= 10000 
                         details['scale'] = round(value, 2)
         except Exception:
-            pass # 忽略爬取失败
+            pass 
         # 2. 基金经理 (manager)
         try:
             manager_tag = soup.find('a', attrs={'href': re.compile(r'/manager/\d+\.html')})
             if manager_tag:
                 details['manager'] = manager_tag.text.strip()
         except Exception:
-            pass # 忽略爬取失败
+            pass 
+        # 3. 基金名称 (name) - 从标题或描述中获取
+        try:
+            name_tag = soup.find('div', class_='fundDetail-tit')
+            if name_tag:
+                name_text = name_tag.find('div', class_='dataItem02').text.strip().split('(')[0]
+                details['name'] = name_text
+        except Exception:
+            pass
             
-    cache[fund_code] = details # 缓存结果
+    cache[fund_code] = details
     return details
 
-def analyze_fund(fund_code, start_date, end_date):
+
+def analyze_fund(df_fund, start_date, end_date):
     """
     计算基金的夏普比率、波动率和最大回撤。
+    输入参数改为 DataFrame，避免重复加载。
     """
-    local_path = os.path.join(FUND_DATA_DIR, f'{fund_code}.csv')
-    df_fund = pd.DataFrame()
-    
-    # 优先从本地加载
-    try:
-        if os.path.exists(local_path):
-            df_fund = pd.read_csv(local_path)
-            if 'date' in df_fund.columns and 'net_value' in df_fund.columns:
-                df_fund.rename(columns={'date': '净值日期', 'net_value': '单位净值'}, inplace=True)
-                df_fund['净值日期'] = pd.to_datetime(df_fund['净值日期'])
-                df_fund['单位净值'] = pd.to_numeric(df_fund['单位净值'], errors='coerce')
-                df_fund = df_fund.dropna(subset=['单位净值'])
-                df_fund.set_index('净值日期', inplace=True)
-                df_fund = df_fund.sort_index()
-                
-                df_fund = df_fund[df_fund.index >= pd.to_datetime(start_date)]
-                df_fund = df_fund[df_fund.index <= pd.to_datetime(end_date)]
-                
-                if df_fund.empty:
-                    raise ValueError("本地数据不在指定日期范围内，尝试下载。")
-            else:
-                raise ValueError("本地CSV文件格式不正确，尝试下载。")
-        else:
-            raise FileNotFoundError("本地CSV文件不存在，尝试下载。")
-    except Exception:
-        # Fallback to online download
-        try:
-            # **修复：使用 fund_em_open_fund_info_index 获取净值走势**
-            df_fund = ak.fund_em_open_fund_info_index(
-                fund=fund_code, 
-                start_date=start_date.replace('-', ''), 
-                end_date=end_date.replace('-', ''), 
-                indicator='单位净值走势'
-            )
-            df_fund.columns = ['净值日期', '单位净值', '累计净值'] 
-            df_fund['净值日期'] = pd.to_datetime(df_fund['净值日期'])
-            df_fund['单位净值'] = pd.to_numeric(df_fund['单位净值'], errors='coerce')
-            df_fund = df_fund.dropna(subset=['单位净值'])
-            df_fund.set_index('净值日期', inplace=True)
-            df_fund = df_fund.sort_index()
-        except Exception as e:
-            return {'error': f"无法获取基金 {fund_code} 净值进行风险分析"}
+    if df_fund.empty:
+        return {'error': "没有有效净值数据"}
+
+    # 确保数据在分析期内
+    df_fund = df_fund[(df_fund['净值日期'] >= pd.to_datetime(start_date)) & 
+                      (df_fund['净值日期'] <= pd.to_datetime(end_date))]
 
     if df_fund.empty:
-        return {'error': f"基金 {fund_code} 在 {start_date} 到 {end_date} 期间没有有效净值数据"}
+        return {'error': "在指定分析期内没有有效净值数据"}
 
     net_values = df_fund['单位净值']
+    # 1. 每日收益率
     daily_returns = net_values.pct_change().dropna()
 
     if daily_returns.empty:
-        return {'error': f"基金 {fund_code} 每日收益率计算失败"}
+        return {'error': "每日收益率计算失败"}
 
-    # 波动率 (Volatitlity - 年化标准差)
+    # 2. 波动率 (Volatitlity - 年化标准差)
     std_daily_return = daily_returns.std()
     annualized_volatility = std_daily_return * np.sqrt(ANNUAL_TRADING_DAYS)
     
-    # 夏普比率 (Sharpe Ratio)
+    # 3. 夏普比率 (Sharpe Ratio)
     mean_daily_return = daily_returns.mean()
     risk_free_rate_daily = RISK_FREE_RATE / ANNUAL_TRADING_DAYS
     
@@ -307,7 +279,7 @@ def analyze_fund(fund_code, start_date, end_date):
         annualized_mean_excess_return = (mean_daily_return - risk_free_rate_daily) * ANNUAL_TRADING_DAYS
         sharpe_ratio = annualized_mean_excess_return / annualized_volatility
         
-    # 最大回撤 (Max Drawdown)
+    # 4. 最大回撤 (Max Drawdown)
     cumulative_returns = (1 + daily_returns).cumprod()
     rolling_max = cumulative_returns.cummax()
     drawdown = (cumulative_returns - rolling_max) / rolling_max
@@ -319,11 +291,12 @@ def analyze_fund(fund_code, start_date, end_date):
         'volatility': round(annualized_volatility * 100, 2) # 百分比形式
     }
 
-def process_single_fund(fund_code, fund_name, start_date, end_date):
+def process_single_fund(fund_code, start_date, end_date, download_start_date='2020-01-01'):
     """单个基金的并行处理逻辑。"""
     result_data = {
         'code': fund_code,
-        'name': fund_name,
+        'name': 'N/A', # 初始为 N/A
+        'rose_3y': np.nan, 
         'rose_1y': np.nan, 
         'rose_6m': np.nan, 
         'scale': np.nan, 
@@ -334,56 +307,68 @@ def process_single_fund(fund_code, fund_name, start_date, end_date):
         'error': None
     }
     
-    print(f"[{time.strftime('%H:%M:%S')}] 正在处理基金 {fund_code} - {fund_name}...")
+    print(f"[{time.strftime('%H:%M:%S')}] 正在处理基金 {fund_code}...")
 
-    # 1. 下载历史净值并计算短期回报
-    download_start_date = '2020-01-01'
-    returns = download_fund_csv(fund_code, start_date=download_start_date, end_date=end_date)
-    if returns['csv_filename']:
-        result_data['rose_1y'] = returns['rose_1y']
-        result_data['rose_6m'] = returns['rose_6m']
+    # 1. 下载历史净值 (包含本地优先逻辑)
+    # 我们使用更长的下载起始日期来确保能够计算 3 年回报率
+    download_result = download_fund_csv(fund_code, start_date=download_start_date, end_date=end_date)
+    df_fund = download_result['df']
+
+    if df_fund.empty:
+        result_data['error'] = '净值数据获取失败或为空。'
+        return result_data
+        
+    # 2. 计算回报率 (3年, 1年, 6个月)
+    returns = calculate_returns(df_fund, end_date)
+    result_data.update(returns)
     
-    # 2. 获取基金详情
+    # 3. 获取基金详情（规模、经理、名称）
     details = get_fund_details(fund_code)
     result_data['scale'] = details.get('scale', np.nan)
     result_data['manager'] = details.get('manager', 'N/A')
+    result_data['name'] = details.get('name', fund_code) # 填充名称
     
-    # 3. 获取并分析风险指标
-    risk_metrics = analyze_fund(fund_code, start_date, end_date) 
+    # 4. 获取并分析风险指标 (使用分析期 start_date 到 end_date)
+    risk_metrics = analyze_fund(df_fund, start_date, end_date) 
     if 'error' not in risk_metrics:
         result_data['sharpe_ratio'] = risk_metrics['sharpe_ratio']
         result_data['max_drawdown'] = risk_metrics['max_drawdown']
         result_data['volatility'] = risk_metrics['volatility']
     else:
         result_data['error'] = risk_metrics['error']
-        print(f"[{time.strftime('%H:%M:%S')}] 基金 {fund_code} 风险分析失败: {risk_metrics['error']}")
+        # print(f"[{time.strftime('%H:%M:%S')}] 基金 {fund_code} 风险分析失败: {risk_metrics['error']}")
 
     return result_data
 
 def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10-14', limit=100):
     """
-    获取基金数据的主函数，使用多线程加速。
+    获取基金数据的主函数，使用多线程加速，并基于本地文件列表。
     """
     start_time = time.time()
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取和分析基金数据...")
-    print(f"分析时间范围: {start_date} 至 {end_date}, 无风险利率: {RISK_FREE_RATE*100}%")
+    print(f"分析时间范围 (风险指标): {start_date} 至 {end_date}, 无风险利率: {RISK_FREE_RATE*100}%")
     
-    # 1. 获取基金排名/基础列表
-    ranking_data = get_fund_rankings(fund_type, start_date, end_date)
+    # 1. 获取本地基金代码列表 (替换了排行榜爬取)
+    ranking_data = get_local_fund_list()
     if ranking_data.empty:
-        print("获取基金列表失败，请检查网络连接或akshare接口。")
+        print("未找到本地基金数据，无法继续。请确保 fund_data 目录下有 CSV 文件。")
         return pd.DataFrame()
         
-    fund_list_to_process = ranking_data.head(limit).index.tolist()
-    initial_ranking_data = ranking_data.head(limit).copy()
-    
+    # 限制处理数量 (基于本地列表)
+    fund_list_to_process = ranking_data.index.tolist()
+    if limit > 0:
+        fund_list_to_process = fund_list_to_process[:limit]
+        
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 准备处理前 {len(fund_list_to_process)} 只基金...")
     
     final_results = []
     
     # 2. 使用多线程并行处理
+    # 设置 download_start_date 确保能覆盖 3 年回报率的计算需求
+    download_start_date = (pd.to_datetime(end_date) - timedelta(days=365*3 + 30)).strftime('%Y-%m-%d')
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_single_fund, code, initial_ranking_data.loc[code, 'name'], start_date, end_date): code for code in fund_list_to_process}
+        futures = {executor.submit(process_single_fund, code, start_date, end_date, download_start_date): code for code in fund_list_to_process}
         
         for i, future in enumerate(as_completed(futures), 1):
             try:
@@ -400,20 +385,22 @@ def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10
         return pd.DataFrame()
 
     # 3. 数据整合、清洗和排序
-    results_df = pd.DataFrame(final_results).set_index('code')
+    merged_data = pd.DataFrame(final_results).set_index('code')
     
-    merged_data = initial_ranking_data.merge(results_df.drop(columns=['name', 'error'], errors='ignore'), left_index=True, right_index=True, how='left')
-
+    # 清洗：移除没有成功计算夏普比率或3年回报的行 (防止结果太多无效数据)
+    merged_data.replace('N/A', np.nan, inplace=True)
     merged_data.dropna(subset=['rose_3y', 'sharpe_ratio'], how='all', inplace=True)
     
+    # 排序：夏普比率降序，3年回报降序
     merged_data.sort_values(by=['sharpe_ratio', 'rose_3y'], ascending=[False, False], inplace=True)
     
     # 格式化输出
     for col in ['rose_3y', 'rose_1y', 'rose_6m', 'max_drawdown', 'volatility']:
-        merged_data[col] = merged_data[col].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
+        merged_data[col] = pd.to_numeric(merged_data[col], errors='coerce').apply(lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
         
-    merged_data['sharpe_ratio'] = merged_data['sharpe_ratio'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else 'N/A')
-    
+    merged_data['sharpe_ratio'] = pd.to_numeric(merged_data['sharpe_ratio'], errors='coerce').apply(lambda x: f"{x:.2f}" if pd.notna(x) else 'N/A')
+    merged_data['scale'] = merged_data['scale'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else 'N/A')
+
     # 调整列顺序
     final_columns = [
         'name', 'manager', 'scale', 
@@ -437,20 +424,19 @@ if __name__ == '__main__':
     # 限制处理前100只基金
     process_limit = 100 
     
-    # 示例: 获取混合型(hh)基金数据
+    # 示例: 基金类型参数已失效，但保留以便于将来扩展
     df_result = get_all_fund_data(
-        fund_type='hh', 
+        fund_type='local', # 更改为 'local' 以明确数据源
         start_date=start_date, 
         end_date=end_date,
         limit=process_limit
     )
     
     if not df_result.empty:
-        # 输出到 Excel
         output_filename = f"fund_screener_optimized_result_{end_date.replace('-', '')}.xlsx"
         df_result.to_excel(output_filename, index=True, index_label='代码', encoding='utf-8')
         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 筛选结果已保存到 {output_filename}")
         print("\n--- 筛选结果预览 (前20条) ---")
         print(df_result.head(20).to_markdown())
     else:
-        print("\n未找到符合条件的基金数据。")
+        print("\n未找到符合条件的基金数据。请确保 fund_data 目录下有基金代码.csv 文件。")
