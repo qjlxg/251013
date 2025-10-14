@@ -51,7 +51,6 @@ def getURL(url, tries_num=5, sleep_time=1, time_out=15, proxies=None):
 
 def get_local_fund_list():
     """
-    修改后的函数：不再爬取排行榜。
     通过扫描本地 fund_data 目录中的 CSV 文件来获取基金代码列表。
     """
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 正在扫描本地目录 {FUND_DATA_DIR} 获取基金代码...")
@@ -73,7 +72,7 @@ def get_local_fund_list():
         return pd.DataFrame()
         
     df = pd.DataFrame(index=fund_codes)
-    # 基金名称和3年回报在初始阶段设置为 NaN，将在后续并行处理中尝试填充
+    # 基金名称和3年回报在初始阶段设置为 NaN
     df['name'] = 'N/A' 
     df['rose_3y'] = np.nan 
     
@@ -196,11 +195,10 @@ def download_fund_csv(fund_code, start_date='2020-01-01', end_date=None, force_d
 
 
 def get_fund_details(fund_code, cache={}):
-    """从网页爬取基金规模和基金经理"""
+    """从网页爬取基金规模、基金经理和基金名称"""
     if fund_code in cache:
         return cache[fund_code]
 
-    # ... (get_fund_details 函数体保持不变，因为只需要规模和经理，这是非核心数据) ...
     url = f"http://fund.eastmoney.com/{fund_code}.html"
     res = getURL(url)
     details = {'scale': np.nan, 'manager': 'N/A', 'name': fund_code} # 增加 name 字段用于回填
@@ -209,7 +207,8 @@ def get_fund_details(fund_code, cache={}):
         soup = BeautifulSoup(res.text, 'html.parser')
         # 1. 基金规模 (scale)
         try:
-            scale_tag = soup.find('td', text=re.compile(r'基金规模'))
+            # 修复 DeprecationWarning: 将 text= 替换为 string=
+            scale_tag = soup.find('td', string=re.compile(r'基金规模'))
             if scale_tag:
                 scale_value_tag = scale_tag.find_next_sibling('td')
                 if scale_value_tag:
@@ -295,7 +294,7 @@ def process_single_fund(fund_code, start_date, end_date, download_start_date='20
     """单个基金的并行处理逻辑。"""
     result_data = {
         'code': fund_code,
-        'name': 'N/A', # 初始为 N/A
+        'name': 'N/A', 
         'rose_3y': np.nan, 
         'rose_1y': np.nan, 
         'rose_6m': np.nan, 
@@ -307,10 +306,9 @@ def process_single_fund(fund_code, start_date, end_date, download_start_date='20
         'error': None
     }
     
-    print(f"[{time.strftime('%H:%M:%S')}] 正在处理基金 {fund_code}...")
+    # print(f"[{time.strftime('%H:%M:%S')}] 正在处理基金 {fund_code}...")
 
     # 1. 下载历史净值 (包含本地优先逻辑)
-    # 我们使用更长的下载起始日期来确保能够计算 3 年回报率
     download_result = download_fund_csv(fund_code, start_date=download_start_date, end_date=end_date)
     df_fund = download_result['df']
 
@@ -336,11 +334,10 @@ def process_single_fund(fund_code, start_date, end_date, download_start_date='20
         result_data['volatility'] = risk_metrics['volatility']
     else:
         result_data['error'] = risk_metrics['error']
-        # print(f"[{time.strftime('%H:%M:%S')}] 基金 {fund_code} 风险分析失败: {risk_metrics['error']}")
 
     return result_data
 
-def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10-14', limit=100):
+def get_all_fund_data(fund_type='local', start_date='2023-10-15', end_date='2025-10-14', limit=100):
     """
     获取基金数据的主函数，使用多线程加速，并基于本地文件列表。
     """
@@ -348,7 +345,7 @@ def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 开始获取和分析基金数据...")
     print(f"分析时间范围 (风险指标): {start_date} 至 {end_date}, 无风险利率: {RISK_FREE_RATE*100}%")
     
-    # 1. 获取本地基金代码列表 (替换了排行榜爬取)
+    # 1. 获取本地基金代码列表
     ranking_data = get_local_fund_list()
     if ranking_data.empty:
         print("未找到本地基金数据，无法继续。请确保 fund_data 目录下有 CSV 文件。")
@@ -364,7 +361,6 @@ def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10
     final_results = []
     
     # 2. 使用多线程并行处理
-    # 设置 download_start_date 确保能覆盖 3 年回报率的计算需求
     download_start_date = (pd.to_datetime(end_date) - timedelta(days=365*3 + 30)).strftime('%Y-%m-%d')
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -375,7 +371,7 @@ def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10
                 result = future.result()
                 if result:
                     final_results.append(result)
-                # print(f"[{time.strftime('%H:%M:%S')}] 完成处理 {i}/{len(fund_list_to_process)} 基金。")
+                print(f"[{time.strftime('%H:%M:%S')}] 完成处理 {i}/{len(fund_list_to_process)} 基金。")
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] 基金处理过程中发生错误: {e}")
                 
@@ -387,11 +383,9 @@ def get_all_fund_data(fund_type='hh', start_date='2023-10-15', end_date='2025-10
     # 3. 数据整合、清洗和排序
     merged_data = pd.DataFrame(final_results).set_index('code')
     
-    # 清洗：移除没有成功计算夏普比率或3年回报的行 (防止结果太多无效数据)
     merged_data.replace('N/A', np.nan, inplace=True)
     merged_data.dropna(subset=['rose_3y', 'sharpe_ratio'], how='all', inplace=True)
     
-    # 排序：夏普比率降序，3年回报降序
     merged_data.sort_values(by=['sharpe_ratio', 'rose_3y'], ascending=[False, False], inplace=True)
     
     # 格式化输出
@@ -424,9 +418,8 @@ if __name__ == '__main__':
     # 限制处理前100只基金
     process_limit = 100 
     
-    # 示例: 基金类型参数已失效，但保留以便于将来扩展
     df_result = get_all_fund_data(
-        fund_type='local', # 更改为 'local' 以明确数据源
+        fund_type='local', 
         start_date=start_date, 
         end_date=end_date,
         limit=process_limit
@@ -434,7 +427,8 @@ if __name__ == '__main__':
     
     if not df_result.empty:
         output_filename = f"fund_screener_optimized_result_{end_date.replace('-', '')}.xlsx"
-        df_result.to_excel(output_filename, index=True, index_label='代码', encoding='utf-8')
+        # 修复: 移除 encoding 参数
+        df_result.to_excel(output_filename, index=True, index_label='代码') 
         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 筛选结果已保存到 {output_filename}")
         print("\n--- 筛选结果预览 (前20条) ---")
         print(df_result.head(20).to_markdown())
