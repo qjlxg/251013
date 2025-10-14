@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import requests
 from datetime import datetime, timedelta
 
 # 加载配置文件
